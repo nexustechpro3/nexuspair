@@ -1,7 +1,5 @@
 import makeWASocket, {
-  makeCacheableSignalKeyStore,
   DisconnectReason,
-  Browsers,
 } from '@nexustechpro/baileys'
 import pino from 'pino'
 import { openAuthState } from '../storage/keyvAuth.js'
@@ -18,7 +16,7 @@ export async function runPairingSession(requestId, phoneNumber) {
   let sock = null
   let timeoutTimer = null
   let settled = false
-  let clearSessionFn = null // captured once openAuthState resolves, used on every failure path
+  let clearSessionFn = null
 
   const clearTimeoutTimer = () => {
     if (timeoutTimer) {
@@ -27,9 +25,6 @@ export async function runPairingSession(requestId, phoneNumber) {
     }
   }
 
-  // Shared cleanup for every failure path (timeout, logout, thrown error):
-  // wipes the partial/incomplete Mongo namespace for this phone number,
-  // since no session token exists yet to let the 30-min sweep find it.
   const wipeAuthState = async () => {
     try {
       if (clearSessionFn) await clearSessionFn()
@@ -41,16 +36,15 @@ export async function runPairingSession(requestId, phoneNumber) {
   try {
     emit('connecting')
 
+    // auth: state — passed directly, untouched. No manual { creds, keys }
+    // destructuring, no makeCacheableSignalKeyStore wrapping. This matches
+    // the confirmed-working connection pattern exactly.
     const { state, saveCreds, clearSession } = await openAuthState(phoneNumber)
     clearSessionFn = clearSession
-    const logger = pino({ level: 'silent' })
+    const logger = pino({ level: 'debug' })
 
     sock = makeWASocket({
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger),
-      },
-      browser: Browsers.ubuntu('Chrome'),
+      auth: state,
       logger,
       printQRInTerminal: false,
     })
@@ -68,13 +62,17 @@ export async function runPairingSession(requestId, phoneNumber) {
     timeoutTimer.unref?.()
 
     if (!sock.authState.creds.registered) {
-      emit('pairing_code_generated', { pairingCode: await sock.requestPairingCode(phoneNumber, 'NEXUSBOT') })
+      emit('pairing_code_generated', { pairingCode: await sock.requestPairingCode(phoneNumber) })
       emit('awaiting_pairing')
     }
 
     await new Promise((resolve, reject) => {
       sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update
+
+        if (connection === 'connecting') {
+          console.log('[pairing] connecting...')
+        }
 
         if (connection === 'open') {
           if (settled) return
@@ -92,8 +90,6 @@ export async function runPairingSession(requestId, phoneNumber) {
 
             emit('session_ready', { sessionId })
 
-            // success path — session token now exists and owns cleanup via
-            // /confirm, /delete, or the 30-min sweep. Do NOT clearSession here.
             settled = true
             await sock.end()
             emit('closed')
@@ -102,7 +98,7 @@ export async function runPairingSession(requestId, phoneNumber) {
           } catch (err) {
             settled = true
             emit('error', { message: err.message })
-            await wipeAuthState() // failed after paired, before a token exists — wipe it
+            await wipeAuthState()
             try { await sock.end() } catch {}
             emit('closed')
             reject(err)
@@ -113,12 +109,19 @@ export async function runPairingSession(requestId, phoneNumber) {
           if (settled) return
 
           const statusCode = lastDisconnect?.error?.output?.statusCode
+          console.log('[pairing] disconnected, code:', statusCode)
+
           if (statusCode === DisconnectReason.loggedOut) {
             settled = true
             emit('error', { message: 'logged out during pairing' })
             await wipeAuthState()
             reject(new Error('logged out during pairing'))
           }
+          // any other close before 'open' is left alone — Baileys may
+          // reconnect internally during the handshake, same as your
+          // working file's run() reconnect pattern, just scoped to
+          // "don't treat it as fatal yet" here since this is a one-shot
+          // pairing flow, not a long-lived bot process
         }
       })
     })
