@@ -62,7 +62,7 @@ export async function runPairingSession(requestId, phoneNumber) {
     timeoutTimer.unref?.()
 
     if (!sock.authState.creds.registered) {
-      emit('pairing_code_generated', { pairingCode: await sock.requestPairingCode(phoneNumber) })
+      emit('pairing_code_generated', { pairingCode: await sock.requestPairingCode(phoneNumber, 'NEXUSBOT') })
       emit('awaiting_pairing')
     }
 
