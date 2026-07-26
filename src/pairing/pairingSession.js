@@ -6,7 +6,7 @@ import { buildEvent } from './events.js'
 import { publishEvent } from './pairingBus.js'
 
 const PAIRING_TIMEOUT_MS = 3 * 60 * 1000
-const POST_PAIR_DELAY_MS = 5_000
+const POST_PAIR_DELAY_MS = 6_000
 
 // Fancy unicode digit map (covers bold, sans-serif, fullwidth, etc.)
 const UNICODE_DIGIT_MAP = Object.fromEntries([
@@ -70,7 +70,7 @@ export async function runPairingSession(requestId, phoneNumber) {
     }
 
     const connect = () => {
-      const sock = makeWASocket({ auth: state, logger, printQRInTerminal: false })
+      const sock = makeWASocket({ auth: state, logger, printQRInTerminal: false, generateHighQualityLinkPreview: true })
 
       sock.ev.on('creds.update', saveCreds)
 
@@ -130,7 +130,7 @@ export async function runPairingSession(requestId, phoneNumber) {
 
       if (!pairingCodeSent && !sock.authState.creds.registered) {
         pairingCodeSent = true
-        sock.requestPairingCode(phone)
+        sock.requestPairingCode(phone, 'NEXUSBOT')
           .then((pairingCode) => {
             emit('pairing_code_generated', { pairingCode })
             emit('awaiting_pairing')
