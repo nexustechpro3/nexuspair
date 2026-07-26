@@ -1,185 +1,144 @@
-import makeWASocket, {
-  DisconnectReason,
-} from '@nexustechpro/baileys'
+import makeWASocket, { DisconnectReason } from '@nexustechpro/baileys'
 import pino from 'pino'
 import { openAuthState } from '../storage/keyvAuth.js'
 import { createSession } from '../storage/sessionRegistry.js'
 import { buildEvent } from './events.js'
 import { publishEvent } from './pairingBus.js'
 
-const WAITING_BEFORE_SESSION_SECONDS = 6
-const PAIRING_TIMEOUT_MS = 3 * 60 * 1000 // 3 minutes
+const PAIRING_TIMEOUT_MS = 3 * 60 * 1000
+const POST_PAIR_DELAY_MS = 5_000
+
+// Fancy unicode digit map (covers bold, sans-serif, fullwidth, etc.)
+const UNICODE_DIGIT_MAP = Object.fromEntries([
+  // fullwidth 0–9: ０–９
+  ...[...Array(10)].map((_, i) => [String.fromCodePoint(0xff10 + i), String(i)]),
+  // mathematical bold 𝟎–𝟗
+  ...[...Array(10)].map((_, i) => [String.fromCodePoint(0x1d7ce + i), String(i)]),
+  // mathematical sans-serif 𝟢–𝟫
+  ...[...Array(10)].map((_, i) => [String.fromCodePoint(0x1d7e2 + i), String(i)]),
+  // mathematical double-struck 𝟘–𝟡
+  ...[...Array(10)].map((_, i) => [String.fromCodePoint(0x1d7d8 + i), String(i)]),
+  // mathematical monospace 𝟶–𝟿
+  ...[...Array(10)].map((_, i) => [String.fromCodePoint(0x1d7f6 + i), String(i)]),
+  // mathematical bold italic 𝟏 range — same as bold above, already covered
+])
+
+const normalizePhone = (raw) => {
+  // Normalize unicode fancy digits → ASCII
+  const decoded = [...raw].map((ch) => UNICODE_DIGIT_MAP[ch] ?? ch).join('')
+  // Strip everything except digits and leading +
+  return decoded.replace(/[^\d+]/g, '').replace(/^\+/, '')
+}
+
+const logger = pino({ level: 'silent' })
 
 export async function runPairingSession(requestId, phoneNumber) {
-  const emit = (stage, fields) => {
-    console.log(`[pairing:${phoneNumber}] stage=${stage}`, fields ?? '')
-    publishEvent(requestId, buildEvent(stage, fields))
-  }
+  const phone = normalizePhone(phoneNumber)
 
-  let timeoutTimer = null
+  const emit = (stage, fields) =>
+    publishEvent(requestId, buildEvent(stage, { phone, ...fields }))
+
   let settled = false
+  let timeoutTimer = null
   let clearSessionFn = null
   let pairingCodeSent = false
-  let attempt = 0
 
-  const clearTimeoutTimer = () => {
+  const settle = () => {
+    settled = true
     if (timeoutTimer) {
       clearTimeout(timeoutTimer)
       timeoutTimer = null
     }
   }
 
-  const wipeAuthState = async () => {
-    try {
-      if (clearSessionFn) await clearSessionFn()
-      console.log(`[pairing:${phoneNumber}] clearSession succeeded`)
-    } catch (err) {
-      console.log(`[pairing:${phoneNumber}] clearSession failed:`, err.message)
-    }
+  const wipeAuth = async () => {
+    try { await clearSessionFn?.() } catch { }
   }
 
-  console.log(`[pairing:${phoneNumber}] runPairingSession starting, requestId=${requestId}`)
-
-  const { state, saveCreds, clearSession } = await openAuthState(phoneNumber)
+  const { state, saveCreds, clearSession } = await openAuthState(phone)
   clearSessionFn = clearSession
-  console.log(`[pairing:${phoneNumber}] auth state opened, registered=${state.creds?.registered}`)
 
   await new Promise((resolve, reject) => {
+    const fail = async (err, sock) => {
+      if (settled) return
+      settle()
+      emit('error', { message: err.message })
+      await wipeAuth()
+      try { await sock?.end() } catch { }
+      emit('closed')
+      reject(err)
+    }
+
     const connect = () => {
-      attempt += 1
-      console.log(`[pairing:${phoneNumber}] connect() attempt #${attempt}`)
-
-      const logger = pino({ level: 'debug' })
-
-      const sock = makeWASocket({
-        auth: state,
-        logger,
-        printQRInTerminal: false,
-      })
-
-      console.log(`[pairing:${phoneNumber}] socket created, attaching listeners`)
+      const sock = makeWASocket({ auth: state, logger, printQRInTerminal: false })
 
       sock.ev.on('creds.update', saveCreds)
 
       if (!timeoutTimer) {
         timeoutTimer = setTimeout(async () => {
           if (settled) return
-          settled = true
-          console.log(`[pairing:${phoneNumber}] TIMEOUT after ${PAIRING_TIMEOUT_MS}ms`)
+          settle()
           emit('timeout')
-          await wipeAuthState()
-          try { await sock.end() } catch {}
+          await wipeAuth()
+          try { await sock.end() } catch { }
           emit('closed')
           reject(new Error('pairing timeout'))
         }, PAIRING_TIMEOUT_MS)
         timeoutTimer.unref?.()
-        console.log(`[pairing:${phoneNumber}] timeout timer armed`)
       }
 
-      sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr, isNewLogin } = update
-
-        console.log(`[pairing:${phoneNumber}] connection.update:`, {
-          connection,
-          hasQr: !!qr,
-          isNewLogin,
-          statusCode: lastDisconnect?.error?.output?.statusCode,
-        })
-
+      sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
         if (connection === 'connecting') {
           emit('connecting')
+          return
         }
 
         if (connection === 'open') {
-          console.log(`[pairing:${phoneNumber}] CONNECTION OPEN, user=`, sock.user)
-          if (settled) {
-            console.log(`[pairing:${phoneNumber}] already settled, ignoring open event`)
-            return
-          }
-          clearTimeoutTimer()
+          if (settled) return
           emit('paired')
 
           try {
-            console.log(`[pairing:${phoneNumber}] waiting ${WAITING_BEFORE_SESSION_SECONDS}s before generating session id`)
-            await new Promise((r) => setTimeout(r, WAITING_BEFORE_SESSION_SECONDS * 1000))
-            emit('waiting_before_session', { seconds: WAITING_BEFORE_SESSION_SECONDS })
-
-            const sessionId = await createSession(phoneNumber)
-            console.log(`[pairing:${phoneNumber}] session created: ${sessionId}`)
-
+            emit('waiting_before_session', { ms: POST_PAIR_DELAY_MS })
+            await new Promise((r) => setTimeout(r, POST_PAIR_DELAY_MS))
+            const sessionId = await createSession(phone)
             await sock.sendMessage(sock.user.id, { text: sessionId })
-            console.log(`[pairing:${phoneNumber}] sessionId sent to own WhatsApp`)
             emit('session_sent_to_whatsapp')
-
             emit('session_ready', { sessionId })
-
-            settled = true
-            console.log(`[pairing:${phoneNumber}] calling sock.end() after successful session_ready`)
+            settle()
             await sock.end()
             emit('closed')
-
             resolve()
           } catch (err) {
-            settled = true
-            console.log(`[pairing:${phoneNumber}] ERROR after open:`, err.message)
-            emit('error', { message: err.message })
-            await wipeAuthState()
-            try { await sock.end() } catch {}
-            emit('closed')
-            reject(err)
+            await fail(err, sock)
           }
+          return
         }
 
         if (connection === 'close') {
-          if (settled) {
-            console.log(`[pairing:${phoneNumber}] close event but already settled, ignoring`)
+          if (settled) return
+
+          const code = lastDisconnect?.error?.output?.statusCode
+
+          if (code === DisconnectReason.loggedOut) {
+            await fail(new Error('logged out during pairing'), sock)
             return
           }
 
-          const statusCode = lastDisconnect?.error?.output?.statusCode
-          console.log(`[pairing:${phoneNumber}] CLOSE, statusCode=${statusCode}`, lastDisconnect?.error?.message)
-
-          if (statusCode === DisconnectReason.loggedOut) {
-            settled = true
-            console.log(`[pairing:${phoneNumber}] logged out, not reconnecting`)
-            emit('error', { message: 'logged out during pairing' })
-            await wipeAuthState()
-            reject(new Error('logged out during pairing'))
-            return
-          }
-
-          console.log(`[pairing:${phoneNumber}] non-fatal close (code ${statusCode}), reconnecting...`)
           connect()
         }
       })
 
       if (!pairingCodeSent && !sock.authState.creds.registered) {
         pairingCodeSent = true
-        console.log(`[pairing:${phoneNumber}] requesting pairing code...`)
-        sock.requestPairingCode(phoneNumber)
+        sock.requestPairingCode(phone)
           .then((pairingCode) => {
-            console.log(`[pairing:${phoneNumber}] pairing code received: ${pairingCode}`)
             emit('pairing_code_generated', { pairingCode })
             emit('awaiting_pairing')
           })
-          .catch(async (err) => {
-            console.log(`[pairing:${phoneNumber}] requestPairingCode FAILED:`, err.message)
-            if (settled) return
-            settled = true
-            emit('error', { message: err.message })
-            await wipeAuthState()
-            try { await sock.end() } catch {}
-            emit('closed')
-            reject(err)
-          })
-      } else {
-        console.log(`[pairing:${phoneNumber}] skipping pairing code request (already sent=${pairingCodeSent}, registered=${sock.authState.creds.registered})`)
+          .catch((err) => fail(err, sock))
       }
     }
 
     connect()
   })
-
-  clearTimeoutTimer()
-  console.log(`[pairing:${phoneNumber}] runPairingSession finished`)
 }
