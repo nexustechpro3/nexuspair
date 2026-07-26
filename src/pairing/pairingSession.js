@@ -7,6 +7,7 @@ import { publishEvent } from './pairingBus.js'
 
 const PAIRING_TIMEOUT_MS = 3 * 60 * 1000
 const POST_PAIR_DELAY_MS = 6_000
+const STEP_DELAY_MS = 2_000 // 2s between connecting → code generated, and code generated → show code
 
 const UNICODE_DIGIT_MAP = Object.fromEntries([
   ...[...Array(10)].map((_, i) => [String.fromCodePoint(0xff10 + i), String(i)]),
@@ -21,6 +22,14 @@ const normalizePhone = (raw) => {
   return decoded.replace(/[^\d+]/g, '').replace(/^\+/, '')
 }
 
+// Resolve a display name from sock.user — handles null string, undefined, empty
+const resolveName = (user, phone) => {
+  const name = user?.name
+  if (!name || name === 'null' || name.trim() === '') return `+${phone}`
+  return name
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const logger = pino({ level: 'silent' })
 
 export async function runPairingSession(requestId, phoneNumber) {
@@ -33,7 +42,7 @@ export async function runPairingSession(requestId, phoneNumber) {
   let timeoutTimer = null
   let clearSessionFn = null
   let pairingCodeSent = false
-  let attempt = 0 // track reconnect attempts — only emit 'connecting' on first
+  let attempt = 0
 
   const settle = () => {
     settled = true
@@ -44,7 +53,7 @@ export async function runPairingSession(requestId, phoneNumber) {
   }
 
   const wipeAuth = async () => {
-    try { await clearSessionFn?.() } catch {}
+    try { await clearSessionFn?.() } catch { }
   }
 
   const { state, saveCreds, clearSession } = await openAuthState(phone)
@@ -56,7 +65,7 @@ export async function runPairingSession(requestId, phoneNumber) {
       settle()
       emit('error', { message: err.message })
       await wipeAuth()
-      try { await sock?.end() } catch {}
+      try { await sock?.end() } catch { }
       emit('closed')
       reject(err)
     }
@@ -80,7 +89,7 @@ export async function runPairingSession(requestId, phoneNumber) {
           settle()
           emit('timeout')
           await wipeAuth()
-          try { await sock.end() } catch {}
+          try { await sock.end() } catch { }
           emit('closed')
           reject(new Error('pairing timeout'))
         }, PAIRING_TIMEOUT_MS)
@@ -89,22 +98,23 @@ export async function runPairingSession(requestId, phoneNumber) {
 
       sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
         if (connection === 'connecting') {
-          // only emit 'connecting' on the first attempt — subsequent connects
-          // are internal 515 reconnects, invisible to the user
+          // only emit on first attempt — reconnects are internal, not shown
           if (isFirstAttempt) emit('connecting')
           return
         }
 
         if (connection === 'open') {
           if (settled) return
-          emit('paired')
+
+          const name = resolveName(sock.user, phone)
+          emit('paired', { name })
 
           try {
             emit('waiting_before_session', { ms: POST_PAIR_DELAY_MS })
-            await new Promise((r) => setTimeout(r, POST_PAIR_DELAY_MS))
+            await sleep(POST_PAIR_DELAY_MS)
             const sessionId = await createSession(phone)
             await sock.sendMessage(sock.user.id, { text: sessionId })
-            emit('session_sent_to_whatsapp')
+            emit('session_sent_to_whatsapp', { name })
             emit('session_ready', { sessionId })
             settle()
             await sock.end()
@@ -129,10 +139,15 @@ export async function runPairingSession(requestId, phoneNumber) {
 
       if (!pairingCodeSent && !sock.authState.creds.registered) {
         pairingCodeSent = true
-        sock.requestPairingCode(phone, 'NEXUSBOT')
-          .then((pairingCode) => {
+
+        // Step 1: emit 'connecting' log is already shown above on 'connecting' event.
+        // Wait 2s, then request the code, then emit code generated + wait 2s + show code.
+        sleep(STEP_DELAY_MS)
+          .then(() => sock.requestPairingCode(phone, 'NEXUSBOT'))
+          .then(async (pairingCode) => {
             emit('pairing_code_generated', { pairingCode })
-            emit('awaiting_pairing')
+            await sleep(STEP_DELAY_MS)
+            emit('awaiting_pairing', { pairingCode })
           })
           .catch((err) => fail(err, sock))
       }
