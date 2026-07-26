@@ -8,25 +8,16 @@ import { publishEvent } from './pairingBus.js'
 const PAIRING_TIMEOUT_MS = 3 * 60 * 1000
 const POST_PAIR_DELAY_MS = 6_000
 
-// Fancy unicode digit map (covers bold, sans-serif, fullwidth, etc.)
 const UNICODE_DIGIT_MAP = Object.fromEntries([
-  // fullwidth 0–9: ０–９
   ...[...Array(10)].map((_, i) => [String.fromCodePoint(0xff10 + i), String(i)]),
-  // mathematical bold 𝟎–𝟗
   ...[...Array(10)].map((_, i) => [String.fromCodePoint(0x1d7ce + i), String(i)]),
-  // mathematical sans-serif 𝟢–𝟫
   ...[...Array(10)].map((_, i) => [String.fromCodePoint(0x1d7e2 + i), String(i)]),
-  // mathematical double-struck 𝟘–𝟡
   ...[...Array(10)].map((_, i) => [String.fromCodePoint(0x1d7d8 + i), String(i)]),
-  // mathematical monospace 𝟶–𝟿
   ...[...Array(10)].map((_, i) => [String.fromCodePoint(0x1d7f6 + i), String(i)]),
-  // mathematical bold italic 𝟏 range — same as bold above, already covered
 ])
 
 const normalizePhone = (raw) => {
-  // Normalize unicode fancy digits → ASCII
   const decoded = [...raw].map((ch) => UNICODE_DIGIT_MAP[ch] ?? ch).join('')
-  // Strip everything except digits and leading +
   return decoded.replace(/[^\d+]/g, '').replace(/^\+/, '')
 }
 
@@ -42,6 +33,7 @@ export async function runPairingSession(requestId, phoneNumber) {
   let timeoutTimer = null
   let clearSessionFn = null
   let pairingCodeSent = false
+  let attempt = 0 // track reconnect attempts — only emit 'connecting' on first
 
   const settle = () => {
     settled = true
@@ -52,7 +44,7 @@ export async function runPairingSession(requestId, phoneNumber) {
   }
 
   const wipeAuth = async () => {
-    try { await clearSessionFn?.() } catch { }
+    try { await clearSessionFn?.() } catch {}
   }
 
   const { state, saveCreds, clearSession } = await openAuthState(phone)
@@ -64,13 +56,21 @@ export async function runPairingSession(requestId, phoneNumber) {
       settle()
       emit('error', { message: err.message })
       await wipeAuth()
-      try { await sock?.end() } catch { }
+      try { await sock?.end() } catch {}
       emit('closed')
       reject(err)
     }
 
     const connect = () => {
-      const sock = makeWASocket({ auth: state, logger, printQRInTerminal: false, generateHighQualityLinkPreview: true })
+      attempt += 1
+      const isFirstAttempt = attempt === 1
+
+      const sock = makeWASocket({
+        auth: state,
+        logger,
+        printQRInTerminal: false,
+        generateHighQualityLinkPreview: true,
+      })
 
       sock.ev.on('creds.update', saveCreds)
 
@@ -80,7 +80,7 @@ export async function runPairingSession(requestId, phoneNumber) {
           settle()
           emit('timeout')
           await wipeAuth()
-          try { await sock.end() } catch { }
+          try { await sock.end() } catch {}
           emit('closed')
           reject(new Error('pairing timeout'))
         }, PAIRING_TIMEOUT_MS)
@@ -89,7 +89,9 @@ export async function runPairingSession(requestId, phoneNumber) {
 
       sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
         if (connection === 'connecting') {
-          emit('connecting')
+          // only emit 'connecting' on the first attempt — subsequent connects
+          // are internal 515 reconnects, invisible to the user
+          if (isFirstAttempt) emit('connecting')
           return
         }
 
@@ -116,14 +118,11 @@ export async function runPairingSession(requestId, phoneNumber) {
 
         if (connection === 'close') {
           if (settled) return
-
           const code = lastDisconnect?.error?.output?.statusCode
-
           if (code === DisconnectReason.loggedOut) {
             await fail(new Error('logged out during pairing'), sock)
             return
           }
-
           connect()
         }
       })
