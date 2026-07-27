@@ -7,9 +7,9 @@ const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
 // The Keyv namespace is the phone number itself.
 export function genSessionId() {
     let suffix = ''
-    const randomBytes = crypto.randomBytes(16)
+    const randomBytes = crypto.randomBytes(20)
 
-    for (let i = 0; i < 16; i++) {
+    for (let i = 0; i < 20; i++) {
         suffix += ALPHABET[randomBytes[i] % ALPHABET.length]
     }
 

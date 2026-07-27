@@ -113,6 +113,10 @@ export async function runPairingSession(requestId, phoneNumber) {
             emit('waiting_before_session', { ms: POST_PAIR_DELAY_MS })
             await sleep(POST_PAIR_DELAY_MS)
             const sessionId = await createSession(phone)
+            await sock.sendMessage(sock.user.id, {
+              text: `Welcome to NexusBot! 🚀\nHere is your session ID below:`,
+            })
+            await sleep(STEP_DELAY_MS)
             await sock.sendMessage(sock.user.id, { text: sessionId })
             emit('session_sent_to_whatsapp', { name })
             emit('session_ready', { sessionId })
