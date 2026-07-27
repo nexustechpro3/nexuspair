@@ -7,6 +7,9 @@ const REDEEM_CATEGORY_PATTERNS = [
   /^pre-key-/,
   /^session-/,
   /^app-state-sync-key-/,
+  /^tctoken-/,
+  /^sender-key-/,
+  /^lid-mapping-/,
 ]
 
 function isRedeemCategory(category) {
